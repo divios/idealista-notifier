@@ -290,4 +290,4 @@ if __name__ == "__main__":
             logging.error(f"Unexpected error: {e}")
             print(f"Unexpected error: {e}")
         
-        time.sleep(random.randint(60, 120))
+        time.sleep(random.randint(1800, 3600))
