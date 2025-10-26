@@ -4,11 +4,16 @@ from bs4 import BeautifulSoup
 import json
 import time
 import os
+import sys
 from dotenv import load_dotenv
 import logging
 from fake_useragent import UserAgent
 import random
 from collections import deque
+
+# Import metrics functions from scrap_metrics.py
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from scrap_metrics import get_property_metrics, normalize_location_for_url, clean_size
 
 logging.basicConfig(level=logging.DEBUG, format="|%(levelname)s| %(asctime)s - %(message)s")
 
@@ -21,7 +26,8 @@ PUSHOVER_API_TOKEN = os.getenv("PUSHOVER_API_TOKEN")
 MAX_PRICE = 250000
 
 # Define the search URL with filters (modify as needed)
-IDEALISTA_URL = f"https://www.idealista.com/venta-viviendas/madrid-madrid/con-precio-hasta_{MAX_PRICE},sin-inquilinos,inquilino,publicado_ultimas-24-horas?ordenado-por=fecha-publicacion-desc"
+IDEALISTA_URL = f"https://www.idealista.com/areas/venta-viviendas/con-precio-hasta_{MAX_PRICE},sin-inquilinos,inquilino,publicado_ultimas-24-horas/" + r"?shape=((ksmvFlffWeaHu}NyUowr%40|tC}h]z}LapJbpT`]~pXqwDbnFnu~%40w_%40l~R}jO|jQu|RzyEw{RytA}eEvdG))&ordenado-por=fecha-publicacion-desc"
+print(f"Using Idealista URL: {IDEALISTA_URL}")
 
 # Neighborhoods to exclude
 EXCLUDED_AREAS = [] #["Raval", "Gòtic", "Gotico", "Gótico", "Gotic", "Barceloneta", "Estudio"]
@@ -52,6 +58,121 @@ def save_seen_listings(seen_listings):
     os.makedirs(os.path.dirname(SEEN_LISTINGS_FILE), exist_ok=True)
     with open(SEEN_LISTINGS_FILE, "w") as f:
         json.dump(list(seen_listings), f)
+
+def extract_location_details(session, property_url, max_retries=3):
+    """
+    Fetch property detail page and extract neighborhood and district
+    Retries up to max_retries times if blocked (403)
+    Returns: (neighborhood, district) tuple or (None, None) if not found
+    """
+    for attempt in range(max_retries):
+        try:
+            # Add random delay to avoid detection
+            time.sleep(random.uniform(1, 3))
+            
+            # Rotate User-Agent on retry attempts
+            if attempt > 0:
+                session.headers.update({"User-Agent": UserAgent().random})
+                logging.debug(f"Retry attempt {attempt + 1}/{max_retries} with new User-Agent")
+                # Exponential backoff: wait longer between retries
+                wait_time = random.uniform(2, 5) * (attempt + 1)
+                logging.debug(f"Waiting {wait_time:.1f}s before retry...")
+                time.sleep(wait_time)
+            
+            response = session.get(property_url, timeout=10)
+            
+            # Handle 403 - Retry
+            if response.status_code == 403:
+                logging.warning(f"⚠️ 403 Forbidden on attempt {attempt + 1}/{max_retries}")
+                if attempt < max_retries - 1:
+                    continue  # Try again
+                else:
+                    logging.error(f"❌ Failed after {max_retries} attempts (403)")
+                    return None, None
+            
+            # Other errors - Don't retry
+            if response.status_code != 200:
+                logging.warning(f"Failed to fetch detail page: {response.status_code}")
+                return None, None
+            
+            # Parse location data
+            soup = BeautifulSoup(response.text, "html.parser")
+            header_map = soup.find("div", id="headerMap")
+            
+            if not header_map:
+                logging.warning("headerMap div not found")
+                return None, None
+            
+            location_items = header_map.find_all("li", class_="header-map-list")
+            
+            if len(location_items) >= 3:
+                neighborhood = location_items[1].get_text(strip=True)  # Second item
+                district = location_items[2].get_text(strip=True)      # Third item
+                
+                # Remove "Barrio " prefix from neighborhood
+                if neighborhood.startswith("Barrio "):
+                    neighborhood = neighborhood.replace("Barrio ", "", 1)
+                
+                # Remove "Distrito " prefix from district
+                if district.startswith("Distrito "):
+                    district = district.replace("Distrito ", "", 1)
+                
+                logging.debug(f"✅ Extracted - Neighborhood: {neighborhood}, District: {district}")
+                return neighborhood, district
+            else:
+                logging.warning(f"Not enough location items found: {len(location_items)}")
+                return None, None
+                
+        except Exception as e:
+            logging.error(f"Error extracting location details (attempt {attempt + 1}): {e}")
+            if attempt < max_retries - 1:
+                continue  # Try again on exception
+            return None, None
+    
+    return None, None
+
+def extract_numeric_price(price_string):
+    """
+    Extract numeric value from price string
+    Example: "1,200 €" -> 1200.0
+    Returns: float or None if extraction fails
+    """
+    try:
+        # Remove currency symbols and spaces
+        price_cleaned = price_string.replace("€", "").replace(".", "").replace(",", "").strip()
+        return float(price_cleaned)
+    except (ValueError, AttributeError) as e:
+        logging.warning(f"Failed to extract numeric price from '{price_string}': {e}")
+        return None
+
+def calculate_deal_quality(price, pbn):
+    """
+    Calculate deal quality by comparing price with PBN (Precio Bien Normalizado)
+    Returns: (indicator_emoji, quality_text, percentage_diff)
+    
+    Deal Quality Thresholds:
+    - Excellent: 20%+ below PBN
+    - Good: 10-20% below PBN
+    - Fair: ±10% of PBN
+    - Above Market: 10-20% above PBN
+    - Overpriced: 20%+ above PBN
+    """
+    if not price or not pbn or pbn == 0:
+        return None, None, None
+    
+    # Calculate percentage difference: negative means below PBN (good deal)
+    percentage_diff = ((price - pbn) / pbn) * 100
+    
+    if percentage_diff <= -20:
+        return "🔥", "Excellent Deal!", percentage_diff
+    elif percentage_diff <= -10:
+        return "✅", "Good Deal", percentage_diff
+    elif percentage_diff <= 10:
+        return "👍", "Fair Price", percentage_diff
+    elif percentage_diff <= 20:
+        return "⚠️", "Above Market", percentage_diff
+    else:
+        return "❌", "Overpriced", percentage_diff
 
 def download_image(session, image_url):
     """
@@ -229,6 +350,67 @@ def scrape_idealista():
                 seen_listings.append(link)
                 seen_set.add(link)
 
+                # Extract location details (neighborhood and district) from property page
+                logging.debug(f"Extracting location details for: {link}")
+                neighborhood, district = extract_location_details(session, link, max_retries=3)
+                
+                # Build location info for notification
+                location_info = ""
+                if neighborhood:
+                    location_info += f"📍 {neighborhood}<br>"
+                if district:
+                    location_info += f"🏙️ {district}<br>"
+                
+                if location_info:
+                    location_info += "<br>"  # Add spacing after location info
+
+                # Calculate property metrics (PPAM, PEA, PBN) if location is available
+                metrics_info = ""
+                if neighborhood and district and size != "Not available":
+                    try:
+                        # Convert size string to numeric value
+                        size_numeric = clean_size(size)
+                        
+                        if size_numeric and size_numeric > 0:
+                            # Normalize location names for URL
+                            distrito_url = normalize_location_for_url(district)
+                            vecindario_url = normalize_location_for_url(neighborhood)
+                            
+                            if distrito_url and vecindario_url:
+                                logging.debug(f"Calculating metrics for {distrito_url}/{vecindario_url} with size {size_numeric}m²")
+                                
+                                # Get property metrics (PPAM, PEA, PBN)
+                                ppam, pea, pbn = get_property_metrics(distrito_url, vecindario_url, size_numeric)
+                                
+                                if ppam and pea and pbn:
+                                    metrics_info = f"📊 <b>Market Metrics:</b><br>"
+                                    metrics_info += f"• PPAM: {ppam:,.2f} €/m²<br>"
+                                    metrics_info += f"• PEA: {pea:,.2f} €<br>"
+                                    metrics_info += f"• PBN: {pbn:,.2f} €<br><br>"
+                                    logging.debug(f"✅ Metrics added: PPAM={ppam}, PEA={pea}, PBN={pbn}")
+                                    
+                                    # Calculate deal quality
+                                    price_numeric = extract_numeric_price(price)
+                                    if price_numeric:
+                                        emoji, quality_text, percentage_diff = calculate_deal_quality(price_numeric, pbn)
+                                        if emoji and quality_text and percentage_diff is not None:
+                                            # Format the percentage difference
+                                            diff_sign = "+" if percentage_diff > 0 else ""
+                                            metrics_info += f"💰 <b>Deal Analysis:</b> {price_numeric:,.0f} € ({diff_sign}{percentage_diff:.1f}% vs PBN)<br>"
+                                            metrics_info += f"{emoji} <b>{quality_text}</b><br><br>"
+                                            logging.debug(f"✅ Deal analysis: {quality_text} ({percentage_diff:.1f}%)")
+                                    else:
+                                        logging.warning(f"Could not extract numeric price from '{price}'")
+                                else:
+                                    logging.warning("Metrics calculation returned None values")
+                            else:
+                                logging.warning(f"Could not normalize location: {district}/{neighborhood}")
+                        else:
+                            logging.warning(f"Invalid size value: {size}")
+                    except Exception as e:
+                        logging.error(f"Error calculating metrics: {e}")
+                        # Continue without metrics if calculation fails
+
                 # Extract first image URL
                 image_url = None
                 try:
@@ -266,7 +448,7 @@ def scrape_idealista():
                     notification_title = "🚨 ATIC ALERT! 🚨"
                     priority = 1  # High priority for atico listings
 
-                message = f"""📍 <b>{title}</b><br><br>💰 {price}<br>🛏️ {rooms}<br>📐 {size}<br>🏢 {floor}<br><br>🔗 <a href="{link}">Click here to view</a>"""
+                message = f"""<b>{title}</b><br><br>{location_info}{metrics_info}💰 {price}<br>🛏️ {rooms}<br>📐 {size}<br>🏢 {floor}<br><br>🔗 <a href="{link}">Click here to view</a>"""
                 send_pushover_notification(message, title=notification_title, priority=priority, image_data=image_data)
 
         except Exception as e:
@@ -290,4 +472,4 @@ if __name__ == "__main__":
             logging.error(f"Unexpected error: {e}")
             print(f"Unexpected error: {e}")
         
-        time.sleep(random.randint(1800, 3600))
+        time.sleep(10800) # Wait for 3 hours before next scrape
