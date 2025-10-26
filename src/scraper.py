@@ -53,10 +53,42 @@ def save_seen_listings(seen_listings):
     with open(SEEN_LISTINGS_FILE, "w") as f:
         json.dump(list(seen_listings), f)
 
-def send_pushover_notification(message, title="Idealista Notifier", priority=0):
+def download_image(session, image_url):
     """
-    Send notification via Pushover
+    Download image from Idealista using the same session
+    Returns image bytes or None if download fails
+    """
+    try:
+        if not image_url:
+            return None
+        
+        # Make sure URL is absolute
+        if image_url.startswith("//"):
+            image_url = "https:" + image_url
+        elif image_url.startswith("/"):
+            image_url = "https://www.idealista.com" + image_url
+        
+        logging.debug(f"Downloading image from: {image_url}")
+        response = session.get(image_url, timeout=10)
+        
+        if response.status_code == 200:
+            # Check if image size is reasonable (< 2.5 MB for Pushover limit)
+            if len(response.content) > 2.5 * 1024 * 1024:
+                logging.warning(f"Image too large: {len(response.content)} bytes")
+                return None
+            return response.content
+        else:
+            logging.warning(f"Failed to download image: {response.status_code}")
+            return None
+    except Exception as e:
+        logging.error(f"Error downloading image: {e}")
+        return None
+
+def send_pushover_notification(message, title="Idealista Notifier", priority=0, image_data=None):
+    """
+    Send notification via Pushover with optional image attachment
     priority: -2 (no notification), -1 (quiet), 0 (normal), 1 (high), 2 (emergency)
+    image_data: bytes of image to attach (JPG, PNG, or GIF, max 2.5 MB)
     """
     data = {
         "token": PUSHOVER_API_TOKEN,
@@ -66,8 +98,13 @@ def send_pushover_notification(message, title="Idealista Notifier", priority=0):
         "priority": priority,
         "html": 1  # Enable HTML formatting
     }
+    
+    files = None
+    if image_data:
+        files = {"attachment": ("image.jpg", image_data, "image/jpeg")}
+    
     try:
-        response = requests.post("https://api.pushover.net/1/messages.json", data=data)
+        response = requests.post("https://api.pushover.net/1/messages.json", data=data, files=files)
         return response.status_code == 200
     except Exception as e:
         logging.error(f"Failed to send Pushover notification: {e}")
@@ -192,6 +229,36 @@ def scrape_idealista():
                 seen_listings.append(link)
                 seen_set.add(link)
 
+                # Extract first image URL
+                image_url = None
+                try:
+                    # Try to find the main property image
+                    # Idealista uses various patterns: img with class "item-multimedia", or within picture elements
+                    img_element = listing.find("img", class_="item-multimedia")
+                    if not img_element:
+                        # Alternative: find any img within the listing
+                        img_element = listing.find("img")
+                    
+                    if img_element:
+                        # Check for lazy-loaded images (data-src, data-ondemand-img, etc.)
+                        image_url = (
+                            img_element.get("data-ondemand-img") or
+                            img_element.get("data-src") or
+                            img_element.get("src")
+                        )
+                        logging.debug(f"Found image URL: {image_url}")
+                except Exception as e:
+                    logging.warning(f"Error extracting image URL: {e}")
+
+                # Download the image
+                image_data = None
+                if image_url:
+                    image_data = download_image(session, image_url)
+                    if image_data:
+                        logging.debug(f"Successfully downloaded image ({len(image_data)} bytes)")
+                    else:
+                        logging.warning("Failed to download image, sending notification without image")
+
                 # Send Pushover notification
                 notification_title = "🏡 New Apartment Listing!"
                 priority = 0
@@ -200,7 +267,7 @@ def scrape_idealista():
                     priority = 1  # High priority for atico listings
 
                 message = f"""📍 <b>{title}</b><br><br>💰 {price}<br>🛏️ {rooms}<br>📐 {size}<br>🏢 {floor}<br><br>🔗 <a href="{link}">Click here to view</a>"""
-                send_pushover_notification(message, title=notification_title, priority=priority)
+                send_pushover_notification(message, title=notification_title, priority=priority, image_data=image_data)
 
         except Exception as e:
             logging.debug(f"Error parsing listing: {e}")
