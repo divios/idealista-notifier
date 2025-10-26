@@ -4,8 +4,6 @@ import json
 import time
 import os
 from dotenv import load_dotenv
-from telegram import Bot
-import asyncio
 import logging
 from fake_useragent import UserAgent
 import random
@@ -15,8 +13,8 @@ logging.basicConfig(level=logging.DEBUG, format="|%(levelname)s| %(asctime)s - %
 
 # Load environment variables
 load_dotenv()
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+PUSHOVER_USER_KEY = os.getenv("PUSHOVER_USER_KEY")
+PUSHOVER_API_TOKEN = os.getenv("PUSHOVER_API_TOKEN")
 
 # Max price
 MAX_PRICE = 200000
@@ -25,13 +23,13 @@ MAX_PRICE = 200000
 IDEALISTA_URL = f"https://www.idealista.com/venta-viviendas/madrid-madrid/con-precio-hasta_{MAX_PRICE},sin-inquilinos,inquilino/"
 
 # Neighborhoods to exclude
-EXCLUDED_AREAS = ["Raval", "Gòtic", "Gotico", "Gótico", "Gotic", "Barceloneta", "Estudio"]
+EXCLUDED_AREAS = [] #["Raval", "Gòtic", "Gotico", "Gótico", "Gotic", "Barceloneta", "Estudio"]
 
 # Keywords to filter out
-EXCLUDED_TERMS = ["Alquiler de temporada", "alquiler temporal", "estancia corta", "estudio"]
+EXCLUDED_TERMS = [] #["Alquiler de temporada", "alquiler temporal", "estancia corta", "estudio"]
 
 # Exclude unwanted floors
-EXCLUDED_FLOORS = ["Entreplanta", "Planta 1ᵃ", "Bajo"]
+EXCLUDED_FLOORS = [] #["Entreplanta", "Planta 1ᵃ", "Bajo"]
 
 # Track seen listings to avoid duplicates
 SEEN_LISTINGS_FILE = "/app/data/seen_listings.json"
@@ -54,12 +52,25 @@ def save_seen_listings(seen_listings):
     with open(SEEN_LISTINGS_FILE, "w") as f:
         json.dump(list(seen_listings), f)
 
-async def send_telegram_message(message):
-    bot = Bot(token=TELEGRAM_BOT_TOKEN)
-    await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="Markdown")
-
-def send_message_sync(message):
-    asyncio.run(send_telegram_message(message))
+def send_pushover_notification(message, title="Idealista Notifier", priority=0):
+    """
+    Send notification via Pushover
+    priority: -2 (no notification), -1 (quiet), 0 (normal), 1 (high), 2 (emergency)
+    """
+    data = {
+        "token": PUSHOVER_API_TOKEN,
+        "user": PUSHOVER_USER_KEY,
+        "message": message,
+        "title": title,
+        "priority": priority,
+        "html": 1  # Enable HTML formatting
+    }
+    try:
+        response = requests.post("https://api.pushover.net/1/messages.json", data=data)
+        return response.status_code == 200
+    except Exception as e:
+        logging.error(f"Failed to send Pushover notification: {e}")
+        return False
 
 # Error Handling:
 def load_error_status():
@@ -103,10 +114,10 @@ def scrape_idealista():
         logging.debug(f"⚠️ Error 403 - Access Forbidden!")
         print("⚠️ Error 403 - Access Forbidden!")
         
-        # Notify Telegram only if this error hasn't been sent yet
+        # Notify Pushover only if this error hasn't been sent yet
         if error_status.get("last_error") != 403:
-            message = "🚨 *Error 403 Detected!*\nIdealista has blocked access."
-            asyncio.run(send_telegram_message(message))
+            message = "🚨 <b>Error 403 Detected!</b><br>Idealista has blocked access."
+            send_pushover_notification(message, title="Error 403 - Idealista Blocked", priority=1)
             save_error_status(403)  # Save the error state
 
         return []  # Stop scraping if blocked
@@ -173,19 +184,15 @@ def scrape_idealista():
                 seen_listings.append(link)
                 seen_set.add(link)
 
-                # Send Telegram notification
-                message_title = "🏡 *New Apartment Listing!*"
+                # Send Pushover notification
+                notification_title = "🏡 New Apartment Listing!"
+                priority = 0
                 if is_atico:
-                    message_title = "🚨 *ATIC ALERT!* 🚨"
+                    notification_title = "🚨 ATIC ALERT! 🚨"
+                    priority = 1  # High priority for atico listings
 
-                message = f"""{message_title}\n
-📍 {title}\n
-💰 {price}
-🛏️ {rooms}
-📐 {size}
-🏢 {floor}\n
-🔗 [Click here to view]({link})"""
-                send_message_sync(message)
+                message = f"""📍 <b>{title}</b><br><br>💰 {price}<br>🛏️ {rooms}<br>📐 {size}<br>🏢 {floor}<br><br>🔗 <a href="{link}">Click here to view</a>"""
+                send_pushover_notification(message, title=notification_title, priority=priority)
 
         except Exception as e:
             logging.debug(f"Error parsing listing: {e}")
