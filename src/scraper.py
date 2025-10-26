@@ -1,4 +1,5 @@
 import requests
+import cloudscraper
 from bs4 import BeautifulSoup
 import json
 import time
@@ -103,7 +104,14 @@ def scrape_idealista():
         "Cache-Control": "max-age=0",
     }
 
-    session = requests.Session()
+    # Use cloudscraper to bypass Cloudflare bot protection
+    session = cloudscraper.create_scraper(
+        browser={
+            'browser': 'chrome',
+            'platform': 'windows',
+            'mobile': False
+        }
+    )
     session.headers.update(headers)
     response = session.get(IDEALISTA_URL)
 

@@ -33,10 +33,11 @@ idealista-notifier/
 ## How It Works
 
 1. The script scrapes Idealista every 1-2 minutes (randomized)
-2. It filters out unwanted areas, keywords, and floor types (configurable)
-3. When a new listing appears, it extracts all relevant details
-4. Sends a formatted HTML notification to your Pushover app
-5. Tracks seen listings to avoid duplicates (stores last 100 listings)
+2. Uses **cloudscraper** to bypass Cloudflare's anti-bot protection
+3. It filters out unwanted areas, keywords, and floor types (configurable)
+4. When a new listing appears, it extracts all relevant details
+5. Sends a formatted HTML notification to your Pushover app
+6. Tracks seen listings to avoid duplicates (stores last 100 listings)
 
 ## Setup & Installation
 
