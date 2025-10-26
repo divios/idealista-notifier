@@ -18,10 +18,10 @@ PUSHOVER_USER_KEY = os.getenv("PUSHOVER_USER_KEY")
 PUSHOVER_API_TOKEN = os.getenv("PUSHOVER_API_TOKEN")
 
 # Max price
-MAX_PRICE = 200000
+MAX_PRICE = 250000
 
 # Define the search URL with filters (modify as needed)
-IDEALISTA_URL = f"https://www.idealista.com/venta-viviendas/madrid-madrid/con-precio-hasta_{MAX_PRICE},sin-inquilinos,inquilino/"
+IDEALISTA_URL = f"https://www.idealista.com/venta-viviendas/madrid-madrid/con-precio-hasta_{MAX_PRICE},sin-inquilinos,inquilino,publicado_ultimas-24-horas?ordenado-por=fecha-publicacion-desc"
 
 # Neighborhoods to exclude
 EXCLUDED_AREAS = [] #["Raval", "Gòtic", "Gotico", "Gótico", "Gotic", "Barceloneta", "Estudio"]
