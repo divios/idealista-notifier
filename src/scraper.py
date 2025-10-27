@@ -109,9 +109,11 @@ def extract_location_details(session, property_url, max_retries=3):
                 neighborhood = location_items[1].get_text(strip=True)  # Second item
                 district = location_items[2].get_text(strip=True)      # Third item
                 
-                # Remove "Barrio " prefix from neighborhood
+                # Remove "Barrio " or "Distrito " prefix from neighborhood
                 if neighborhood.startswith("Barrio "):
                     neighborhood = neighborhood.replace("Barrio ", "", 1)
+                elif neighborhood.startswith("Distrito "):
+                    neighborhood = neighborhood.replace("Distrito ", "", 1)
                 
                 # Remove "Distrito " prefix from district
                 if district.startswith("Distrito "):
