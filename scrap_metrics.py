@@ -26,7 +26,7 @@ def build_url(distrito, vecindario):
     Returns:
         Complete Idealista search URL
     """
-    return f"https://www.idealista.com/alquiler-viviendas/madrid/{distrito}/{vecindario}/con-sin-inquilinos,inquilino/?ordenado-por=fecha-publicacion-desc"
+    return f"https://www.idealista.com/alquiler-viviendas/madrid/{distrito}/{vecindario}/con-sin-inquilinos,alquiler-de-larga-temporada,inquilino/?ordenado-por=fecha-publicacion-desc"
 
 def build_url_with_page(distrito, vecindario, page=1):
     """
@@ -40,7 +40,7 @@ def build_url_with_page(distrito, vecindario, page=1):
     Returns:
         Complete Idealista search URL with pagination
     """
-    base = f"https://www.idealista.com/alquiler-viviendas/madrid/{distrito}/{vecindario}"
+    base = f"https://www.idealista.com/alquiler-viviendas/madrid/{distrito}/{vecindario}/con-alquiler-de-larga-temporada"
     if page == 1:
         return f"{base}/?ordenado-por=fecha-publicacion-desc"
     return f"{base}/pagina-{page}.htm?ordenado-por=fecha-publicacion-desc"
