@@ -304,6 +304,9 @@ def scrape_idealista():
     seen_listings = load_seen_listings()
     seen_set = set(seen_listings)
 
+    # Accumulate notifications to send them all at once
+    pending_notifications = []
+
     # Extract each listing
     for listing in soup.find_all("article", class_="item" if "item" in response.text else "listing-item"):  # Adjust class if needed
         try:
@@ -443,7 +446,7 @@ def scrape_idealista():
                     else:
                         logging.warning("Failed to download image, sending notification without image")
 
-                # Send Pushover notification
+                # Prepare notification for batch sending
                 notification_title = "🏡 New Apartment Listing!"
                 priority = 0
                 if is_atico:
@@ -451,11 +454,36 @@ def scrape_idealista():
                     priority = 1  # High priority for atico listings
 
                 message = f"""<b>{title}</b><br><br>{location_info}{metrics_info}💰 {price}<br>🛏️ {rooms}<br>📐 {size}<br>🏢 {floor}<br><br>🔗 <a href="{link}">Click here to view</a>"""
-                send_pushover_notification(message, title=notification_title, priority=priority, image_data=image_data)
+                
+                # Accumulate notification instead of sending immediately
+                pending_notifications.append({
+                    "message": message,
+                    "title": notification_title,
+                    "priority": priority,
+                    "image_data": image_data
+                })
 
         except Exception as e:
             logging.debug(f"Error parsing listing: {e}")
             print("Error parsing listing:", e)
+
+    # Send all accumulated notifications at once
+    if pending_notifications:
+        logging.debug(f"Sending {len(pending_notifications)} accumulated notifications...")
+        print(f"Sending {len(pending_notifications)} accumulated notifications...")
+        
+        for notification in pending_notifications:
+            send_pushover_notification(
+                notification["message"],
+                title=notification["title"],
+                priority=notification["priority"],
+                image_data=notification["image_data"]
+            )
+            # Small delay to avoid rate limiting
+            time.sleep(0.5)
+        
+        logging.debug(f"✅ All {len(pending_notifications)} notifications sent!")
+        print(f"✅ All {len(pending_notifications)} notifications sent!")
 
     save_seen_listings(seen_listings)
     return listings
