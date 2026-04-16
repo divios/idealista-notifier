@@ -131,30 +131,102 @@ def send_telegram_notification(text, image_url=None, session=None):
         return False
 
 
-def scrape_idealista():
-    logging.debug("Scraping Idealista...")
-
-    headers = {
-        "User-Agent": UserAgent().random,
-        "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Referer": "https://www.google.com/",
-        "DNT": "1",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Cache-Control": "max-age=0",
-    }
+def build_session():
+    """Create a cloudscraper session that mimics a real Chrome browser."""
+    ua = UserAgent().random
 
     session = cloudscraper.create_scraper(
         browser={"browser": "chrome", "platform": "windows", "mobile": False}
     )
-    session.headers.update(headers)
-    response = session.get(IDEALISTA_URL)
+    session.headers.update(
+        {
+            "User-Agent": ua,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+            "DNT": "1",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Cache-Control": "max-age=0",
+            "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "sec-fetch-dest": "document",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-site": "none",
+            "sec-fetch-user": "?1",
+        }
+    )
+    return session
+
+
+def warm_up_session(session):
+    """
+    Visit the Idealista homepage first to establish cookies and appear
+    as a real browser navigating the site organically.
+    """
+    try:
+        logging.debug("Warming up session via Idealista homepage...")
+        resp = session.get("https://www.idealista.com/", timeout=15)
+        logging.debug(f"Homepage response: {resp.status_code}")
+        # Update Referer for subsequent requests
+        session.headers.update(
+            {
+                "Referer": "https://www.idealista.com/",
+                "sec-fetch-site": "same-origin",
+            }
+        )
+        # Simulate reading time
+        time.sleep(random.uniform(3, 6))
+    except Exception as e:
+        logging.warning(f"Warm-up request failed: {e}")
+
+
+def fetch_with_retry(session, url, max_retries=3):
+    """
+    Fetch a URL with exponential backoff and User-Agent rotation on 403.
+    Returns the response or None if all retries fail.
+    """
+    for attempt in range(max_retries):
+        if attempt > 0:
+            wait = random.uniform(5, 10) * attempt
+            logging.debug(
+                f"Retry {attempt}/{max_retries - 1} — waiting {wait:.1f}s, rotating UA..."
+            )
+            time.sleep(wait)
+            session.headers.update({"User-Agent": UserAgent().random})
+
+        try:
+            response = session.get(url, timeout=20)
+            logging.debug(f"Attempt {attempt + 1}: status {response.status_code}")
+
+            if response.status_code == 200:
+                return response
+            elif response.status_code == 403:
+                logging.warning(f"403 on attempt {attempt + 1}/{max_retries}")
+                continue
+            else:
+                logging.warning(f"Unexpected status {response.status_code}")
+                return response
+
+        except Exception as e:
+            logging.error(f"Request error on attempt {attempt + 1}: {e}")
+
+    return None  # All retries exhausted
+
+
+def scrape_idealista():
+    logging.debug("Scraping Idealista...")
+
+    session = build_session()
+    warm_up_session(session)
+
+    response = fetch_with_retry(session, IDEALISTA_URL)
 
     error_status = load_error_status()
 
-    if response.status_code == 403:
-        logging.warning("⚠️ Error 403 — Idealista has blocked access")
+    if response is None or response.status_code == 403:
+        logging.warning("⚠️ Error 403 — Idealista has blocked access after all retries")
         if error_status.get("last_error") != 403:
             send_telegram_notification(
                 "🚨 <b>Error 403 detectado</b>\nIdealista ha bloqueado el acceso."
