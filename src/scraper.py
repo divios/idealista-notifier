@@ -1,13 +1,10 @@
 import requests
-import cloudscraper
 from bs4 import BeautifulSoup
 import json
 import time
 import os
 from dotenv import load_dotenv
 import logging
-from fake_useragent import UserAgent
-import random
 from collections import deque
 
 logging.basicConfig(
@@ -18,6 +15,7 @@ logging.basicConfig(
 load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY")
 
 # Idealista search URL — alquiler en Sevilla, ordenado por más reciente
 IDEALISTA_URL = "https://www.idealista.com/alquiler-viviendas/sevilla-sevilla/?ordenado-por=fecha-publicacion-desc"
@@ -131,97 +129,42 @@ def send_telegram_notification(text, image_url=None, session=None):
         return False
 
 
-def build_session():
-    """Create a cloudscraper session that mimics a real Chrome browser."""
-    ua = UserAgent().random
-
-    session = cloudscraper.create_scraper(
-        browser={"browser": "chrome", "platform": "windows", "mobile": False}
-    )
-    session.headers.update(
-        {
-            "User-Agent": ua,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-            "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
-            "Accept-Encoding": "gzip, deflate, br",
-            "DNT": "1",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
-            "Cache-Control": "max-age=0",
-            "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
-            "sec-fetch-dest": "document",
-            "sec-fetch-mode": "navigate",
-            "sec-fetch-site": "none",
-            "sec-fetch-user": "?1",
-        }
-    )
-    return session
-
-
-def warm_up_session(session):
+def fetch_idealista():
     """
-    Visit the Idealista homepage first to establish cookies and appear
-    as a real browser navigating the site organically.
+    Fetch the Idealista search page via ScraperAPI.
+    ScraperAPI handles proxy rotation, headers, JS rendering and anti-bot bypass.
+    Uses country_code=es to ensure a Spanish IP (required by Idealista).
+    Returns the response or None on failure.
     """
+    scraper_url = "http://api.scraperapi.com"
+    params = {
+        "api_key": SCRAPERAPI_KEY,
+        "url": IDEALISTA_URL,
+        "country_code": "es",
+        "render": "false",
+    }
+
     try:
-        logging.debug("Warming up session via Idealista homepage...")
-        resp = session.get("https://www.idealista.com/", timeout=15)
-        logging.debug(f"Homepage response: {resp.status_code}")
-        # Update Referer for subsequent requests
-        session.headers.update(
-            {
-                "Referer": "https://www.idealista.com/",
-                "sec-fetch-site": "same-origin",
-            }
-        )
-        # Simulate reading time
-        time.sleep(random.uniform(3, 6))
-    except Exception as e:
-        logging.warning(f"Warm-up request failed: {e}")
+        logging.debug("Fetching Idealista via ScraperAPI...")
+        response = requests.get(scraper_url, params=params, timeout=60)
+        logging.debug(f"ScraperAPI response: {response.status_code}")
 
-
-def fetch_with_retry(session, url, max_retries=3):
-    """
-    Fetch a URL with exponential backoff and User-Agent rotation on 403.
-    Returns the response or None if all retries fail.
-    """
-    for attempt in range(max_retries):
-        if attempt > 0:
-            wait = random.uniform(5, 10) * attempt
-            logging.debug(
-                f"Retry {attempt}/{max_retries - 1} — waiting {wait:.1f}s, rotating UA..."
+        if response.status_code == 200:
+            return response
+        else:
+            logging.warning(
+                f"ScraperAPI returned {response.status_code}: {response.text[:200]}"
             )
-            time.sleep(wait)
-            session.headers.update({"User-Agent": UserAgent().random})
-
-        try:
-            response = session.get(url, timeout=20)
-            logging.debug(f"Attempt {attempt + 1}: status {response.status_code}")
-
-            if response.status_code == 200:
-                return response
-            elif response.status_code == 403:
-                logging.warning(f"403 on attempt {attempt + 1}/{max_retries}")
-                continue
-            else:
-                logging.warning(f"Unexpected status {response.status_code}")
-                return response
-
-        except Exception as e:
-            logging.error(f"Request error on attempt {attempt + 1}: {e}")
-
-    return None  # All retries exhausted
+            return None
+    except Exception as e:
+        logging.error(f"ScraperAPI request failed: {e}")
+        return None
 
 
 def scrape_idealista():
     logging.debug("Scraping Idealista...")
 
-    session = build_session()
-    warm_up_session(session)
-
-    response = fetch_with_retry(session, IDEALISTA_URL)
+    response = fetch_idealista()
 
     error_status = load_error_status()
 
