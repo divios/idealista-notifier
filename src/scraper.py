@@ -17,8 +17,13 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY")
 
-# Idealista search URL — alquiler en Sevilla, ordenado por más reciente
+# Search URLs — alquiler en Sevilla
 IDEALISTA_URL = "https://www.idealista.com/alquiler-viviendas/sevilla-sevilla/?ordenado-por=fecha-publicacion-desc"
+PISOS_URL = "https://www.pisos.com/alquiler/pisos-sevilla/"
+FOTOCASA_URL = (
+    "https://www.fotocasa.es/es/alquiler/casas/sevilla-capital/todas-las-zonas/l"
+)
+CASAS_URL = "https://www.casas.com/alquiler-pisos/sevilla/"
 
 # Neighborhoods to exclude
 EXCLUDED_AREAS = []
@@ -33,10 +38,12 @@ EXCLUDED_FLOORS = []
 SEEN_LISTINGS_FILE = "/app/data/seen_listings.json"
 
 # Max listings saved in deduplication queue
-MAX_LISTINGS = 100
+MAX_LISTINGS = 300
 
 # Track if an error has already been notified
 ERROR_LOG_FILE = "/app/data/error_log.json"
+
+SCRAPERAPI_BASE = "http://api.scraperapi.com"
 
 
 def load_seen_listings():
@@ -68,7 +75,7 @@ def save_error_status(error_code):
         json.dump({"error": error_code}, f)
 
 
-def send_telegram_notification(text, image_url=None, session=None):
+def send_telegram_notification(text, image_url=None):
     """
     Send a message to the configured Telegram group.
     If image_url is provided, sends a photo with caption; otherwise sends a text message.
@@ -84,7 +91,6 @@ def send_telegram_notification(text, image_url=None, session=None):
             elif image_url.startswith("/"):
                 image_url = "https://www.idealista.com" + image_url
 
-            # Try sending photo with caption (caption max 1024 chars)
             caption = text[:1024]
             resp = requests.post(
                 f"{base_url}/sendPhoto",
@@ -129,43 +135,47 @@ def send_telegram_notification(text, image_url=None, session=None):
         return False
 
 
-def fetch_idealista():
+def fetch_via_scraperapi(url, render=False, retries=2):
     """
-    Fetch the Idealista search page via ScraperAPI.
-    ScraperAPI handles proxy rotation, headers, JS rendering and anti-bot bypass.
-    Uses country_code=es to ensure a Spanish IP (required by Idealista).
+    Fetch a URL via ScraperAPI with optional JS rendering.
     Returns the response or None on failure.
     """
-    scraper_url = "http://api.scraperapi.com"
     params = {
         "api_key": SCRAPERAPI_KEY,
-        "url": IDEALISTA_URL,
+        "url": url,
         "country_code": "es",
-        "render": "false",
+        "render": "true" if render else "false",
     }
 
-    try:
-        logging.debug("Fetching Idealista via ScraperAPI...")
-        response = requests.get(scraper_url, params=params, timeout=60)
-        logging.debug(f"ScraperAPI response: {response.status_code}")
+    for attempt in range(1, retries + 1):
+        try:
+            logging.debug(f"ScraperAPI fetch attempt {attempt}: {url}")
+            response = requests.get(SCRAPERAPI_BASE, params=params, timeout=60)
+            logging.debug(f"ScraperAPI response: {response.status_code}")
+            if response.status_code == 200:
+                return response
+            else:
+                logging.warning(
+                    f"ScraperAPI returned {response.status_code}: {response.text[:200]}"
+                )
+        except Exception as e:
+            logging.error(f"ScraperAPI request failed (attempt {attempt}): {e}")
 
-        if response.status_code == 200:
-            return response
-        else:
-            logging.warning(
-                f"ScraperAPI returned {response.status_code}: {response.text[:200]}"
-            )
-            return None
-    except Exception as e:
-        logging.error(f"ScraperAPI request failed: {e}")
-        return None
+        if attempt < retries:
+            time.sleep(5)
+
+    return None
 
 
-def scrape_idealista():
+# ---------------------------------------------------------------------------
+# Idealista
+# ---------------------------------------------------------------------------
+
+
+def scrape_idealista(seen_listings, seen_set):
     logging.debug("Scraping Idealista...")
 
-    response = fetch_idealista()
-
+    response = fetch_via_scraperapi(IDEALISTA_URL, render=False)
     error_status = load_error_status()
 
     if response is None or response.status_code == 403:
@@ -180,15 +190,8 @@ def scrape_idealista():
     if response.status_code == 200 and error_status.get("last_error") == 403:
         save_error_status(None)
 
-    if response.status_code != 200:
-        logging.error(f"Error fetching page: {response.status_code}")
-        return []
-
     soup = BeautifulSoup(response.text, "html.parser")
-    listings = []
-    seen_listings = load_seen_listings()
-    seen_set = set(seen_listings)
-
+    new_links = []
     pending_notifications = []
 
     for listing in soup.find_all("article", class_="item"):
@@ -215,7 +218,6 @@ def scrape_idealista():
             size = details[1].get_text(strip=True) if len(details) > 1 else "—"
             floor = details[2].get_text(strip=True) if len(details) > 2 else "—"
 
-            # Apply filters
             if any(f.lower() in floor.lower() for f in EXCLUDED_FLOORS):
                 continue
             if any(f.lower() in size.lower() for f in EXCLUDED_FLOORS):
@@ -228,15 +230,13 @@ def scrape_idealista():
             if any(t.lower() in description.lower() for t in EXCLUDED_TERMS):
                 continue
 
-            # Skip already seen
             if link in seen_set:
                 continue
 
-            listings.append(link)
+            new_links.append(link)
             seen_listings.append(link)
             seen_set.add(link)
 
-            # Extract image URL
             image_url = None
             img_el = listing.find("img", class_="item-multimedia") or listing.find(
                 "img"
@@ -248,7 +248,6 @@ def scrape_idealista():
                     or img_el.get("src")
                 )
 
-            # Build message
             ATICO_TERMS = ["Atico", "Ático", "Atic"]
             is_atico = any(
                 t.lower() in title.lower() or t.lower() in description.lower()
@@ -258,7 +257,7 @@ def scrape_idealista():
             header = (
                 "🚨 <b>ÁTICO DISPONIBLE</b> 🚨\n"
                 if is_atico
-                else "🏠 <b>Nuevo piso en alquiler en Sevilla</b>\n"
+                else "🏠 <b>Nuevo piso en alquiler (Idealista)</b>\n"
             )
 
             message = (
@@ -274,28 +273,339 @@ def scrape_idealista():
             pending_notifications.append({"message": message, "image_url": image_url})
 
         except Exception as e:
-            logging.debug(f"Error parsing listing: {e}")
+            logging.debug(f"Error parsing Idealista listing: {e}")
 
     if pending_notifications:
-        logging.debug(f"Sending {len(pending_notifications)} notifications...")
+        logging.debug(
+            f"Sending {len(pending_notifications)} Idealista notifications..."
+        )
         for notif in pending_notifications:
             send_telegram_notification(notif["message"], image_url=notif["image_url"])
             time.sleep(0.5)
-        logging.debug(f"✅ {len(pending_notifications)} notifications sent")
 
-    save_seen_listings(seen_listings)
-    return listings
+    return new_links
 
+
+# ---------------------------------------------------------------------------
+# Pisos.com
+# ---------------------------------------------------------------------------
+
+
+def scrape_pisos(seen_listings, seen_set):
+    logging.debug("Scraping Pisos.com...")
+
+    response = fetch_via_scraperapi(PISOS_URL, render=False)
+    if response is None:
+        logging.warning("Failed to fetch Pisos.com")
+        return []
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    new_links = []
+    pending_notifications = []
+
+    for listing in soup.find_all("div", class_="ad-preview"):
+        try:
+            listing_id = listing.get("id", "")
+            relative_url = listing.get("data-lnk-href", "")
+            if not relative_url:
+                continue
+
+            link = "https://www.pisos.com" + relative_url
+
+            if link in seen_set:
+                continue
+
+            # Title
+            title_el = listing.find("a", class_="ad-preview__title")
+            title = title_el.get_text(strip=True) if title_el else "Sin título"
+
+            # Price — strip the /mes child span
+            price = "Precio no disponible"
+            price_el = listing.find("span", class_="ad-preview__price")
+            if price_el:
+                # Remove child spans (e.g. "/mes") and grab remaining text
+                for child in price_el.find_all("span"):
+                    child.decompose()
+                price = price_el.get_text(strip=True)
+
+            # Details: rooms, bathrooms, size, floor — each in <p class="ad-preview__char ...">
+            details = listing.find_all("p", class_="ad-preview__char")
+            rooms = details[0].get_text(strip=True) if len(details) > 0 else "—"
+            size = details[1].get_text(strip=True) if len(details) > 1 else "—"
+            floor = details[2].get_text(strip=True) if len(details) > 2 else "—"
+
+            # Image
+            image_url = None
+            carousel = listing.find(class_="carousel__main-photo")
+            if carousel:
+                img_el = carousel.find("img") if hasattr(carousel, "find") else None
+                if img_el:
+                    image_url = img_el.get("src") or img_el.get("data-src")
+
+            new_links.append(link)
+            seen_listings.append(link)
+            seen_set.add(link)
+
+            message = (
+                f"🏠 <b>Nuevo piso en alquiler (Pisos.com)</b>\n\n"
+                f"<b>{title}</b>\n\n"
+                f"💰 {price}\n"
+                f"🛏 {rooms}\n"
+                f"📐 {size}\n"
+                f"🏢 {floor}\n\n"
+                f'🔗 <a href="{link}">Ver anuncio</a>'
+            )
+
+            pending_notifications.append({"message": message, "image_url": image_url})
+
+        except Exception as e:
+            logging.debug(f"Error parsing Pisos.com listing: {e}")
+
+    if pending_notifications:
+        logging.debug(
+            f"Sending {len(pending_notifications)} Pisos.com notifications..."
+        )
+        for notif in pending_notifications:
+            send_telegram_notification(notif["message"], image_url=notif["image_url"])
+            time.sleep(0.5)
+
+    return new_links
+
+
+# ---------------------------------------------------------------------------
+# Fotocasa
+# ---------------------------------------------------------------------------
+
+
+def scrape_fotocasa(seen_listings, seen_set):
+    logging.debug("Scraping Fotocasa...")
+
+    # Use render=true so ScraperAPI executes the React SPA and returns full HTML
+    response = fetch_via_scraperapi(FOTOCASA_URL, render=True)
+    if response is None:
+        logging.warning("Failed to fetch Fotocasa")
+        return []
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    new_links = []
+    pending_notifications = []
+
+    # Fotocasa renders listing cards as <article> elements
+    # Each card has a link, price, and detail spans
+    for listing in soup.find_all("article"):
+        try:
+            # Link — look for the main anchor with an href containing /es/alquiler/
+            link_el = listing.find("a", href=lambda h: h and "/es/alquiler/" in h)
+            if not link_el:
+                continue
+
+            href = link_el.get("href", "")
+            link = "https://www.fotocasa.es" + href if href.startswith("/") else href
+
+            if link in seen_set:
+                continue
+
+            # Title — usually in an h3 or the link text
+            title_el = listing.find("h3") or listing.find("h2") or link_el
+            title = title_el.get_text(strip=True) if title_el else "Sin título"
+
+            # Price
+            price = "Precio no disponible"
+            price_el = listing.find(class_=lambda c: c and "price" in c.lower())
+            if price_el:
+                price = price_el.get_text(strip=True)
+
+            # Details — rooms, size, floor typically in spans with feature/detail classes
+            detail_els = listing.find_all(
+                lambda tag: (
+                    tag.name in ("span", "li")
+                    and tag.get("class")
+                    and any(
+                        "feature" in c or "detail" in c or "char" in c
+                        for c in tag.get("class", [])
+                    )
+                )
+            )
+            rooms = detail_els[0].get_text(strip=True) if len(detail_els) > 0 else "—"
+            size = detail_els[1].get_text(strip=True) if len(detail_els) > 1 else "—"
+            floor = detail_els[2].get_text(strip=True) if len(detail_els) > 2 else "—"
+
+            # Image
+            image_url = None
+            img_el = listing.find("img")
+            if img_el:
+                image_url = img_el.get("src") or img_el.get("data-src")
+
+            new_links.append(link)
+            seen_listings.append(link)
+            seen_set.add(link)
+
+            message = (
+                f"🏠 <b>Nuevo piso en alquiler (Fotocasa)</b>\n\n"
+                f"<b>{title}</b>\n\n"
+                f"💰 {price}\n"
+                f"🛏 {rooms}\n"
+                f"📐 {size}\n"
+                f"🏢 {floor}\n\n"
+                f'🔗 <a href="{link}">Ver anuncio</a>'
+            )
+
+            pending_notifications.append({"message": message, "image_url": image_url})
+
+        except Exception as e:
+            logging.debug(f"Error parsing Fotocasa listing: {e}")
+
+    if pending_notifications:
+        logging.debug(f"Sending {len(pending_notifications)} Fotocasa notifications...")
+        for notif in pending_notifications:
+            send_telegram_notification(notif["message"], image_url=notif["image_url"])
+            time.sleep(0.5)
+
+    return new_links
+
+
+# ---------------------------------------------------------------------------
+# Casas.com (silent-fail)
+# ---------------------------------------------------------------------------
+
+
+def scrape_casas(seen_listings, seen_set):
+    logging.debug("Scraping Casas.com...")
+
+    try:
+        response = fetch_via_scraperapi(CASAS_URL, render=False, retries=2)
+        if response is None:
+            logging.warning("Casas.com: failed after retries — skipping silently")
+            return []
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        new_links = []
+        pending_notifications = []
+
+        # Casas.com listing cards — typically <article> or <div> with listing data
+        for listing in soup.find_all("article"):
+            try:
+                link_el = listing.find("a", href=True)
+                if not link_el:
+                    continue
+
+                href = link_el.get("href", "")
+                if href.startswith("/"):
+                    link = "https://www.casas.com" + href
+                elif href.startswith("http"):
+                    link = href
+                else:
+                    continue
+
+                if link in seen_set:
+                    continue
+
+                title_el = listing.find("h2") or listing.find("h3") or link_el
+                title = title_el.get_text(strip=True) if title_el else "Sin título"
+
+                price = "Precio no disponible"
+                price_el = listing.find(class_=lambda c: c and "price" in c.lower())
+                if price_el:
+                    price = price_el.get_text(strip=True)
+
+                detail_els = listing.find_all(
+                    lambda tag: (
+                        tag.name in ("span", "li")
+                        and tag.get("class")
+                        and any(
+                            "feature" in c or "detail" in c or "char" in c
+                            for c in tag.get("class", [])
+                        )
+                    )
+                )
+                rooms = (
+                    detail_els[0].get_text(strip=True) if len(detail_els) > 0 else "—"
+                )
+                size = (
+                    detail_els[1].get_text(strip=True) if len(detail_els) > 1 else "—"
+                )
+                floor = (
+                    detail_els[2].get_text(strip=True) if len(detail_els) > 2 else "—"
+                )
+
+                image_url = None
+                img_el = listing.find("img")
+                if img_el:
+                    image_url = img_el.get("src") or img_el.get("data-src")
+
+                new_links.append(link)
+                seen_listings.append(link)
+                seen_set.add(link)
+
+                message = (
+                    f"🏠 <b>Nuevo piso en alquiler (Casas.com)</b>\n\n"
+                    f"<b>{title}</b>\n\n"
+                    f"💰 {price}\n"
+                    f"🛏 {rooms}\n"
+                    f"📐 {size}\n"
+                    f"🏢 {floor}\n\n"
+                    f'🔗 <a href="{link}">Ver anuncio</a>'
+                )
+
+                pending_notifications.append(
+                    {"message": message, "image_url": image_url}
+                )
+
+            except Exception as e:
+                logging.debug(f"Error parsing Casas.com listing: {e}")
+
+        if pending_notifications:
+            logging.debug(
+                f"Sending {len(pending_notifications)} Casas.com notifications..."
+            )
+            for notif in pending_notifications:
+                send_telegram_notification(
+                    notif["message"], image_url=notif["image_url"]
+                )
+                time.sleep(0.5)
+
+        return new_links
+
+    except Exception as e:
+        logging.warning(f"Casas.com scraper failed — skipping silently: {e}")
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     while True:
         try:
-            new_listings = scrape_idealista()
-            if new_listings:
-                logging.debug(f"Found {len(new_listings)} new listings!")
+            # Load seen listings once — shared across all scrapers
+            seen_listings = load_seen_listings()
+            seen_set = set(seen_listings)
+
+            total_new = 0
+
+            for scraper_fn, name in [
+                (scrape_idealista, "Idealista"),
+                (scrape_pisos, "Pisos.com"),
+                (scrape_fotocasa, "Fotocasa"),
+                (scrape_casas, "Casas.com"),
+            ]:
+                try:
+                    new = scraper_fn(seen_listings, seen_set)
+                    total_new += len(new)
+                    logging.debug(f"{name}: {len(new)} new listings")
+                except Exception as e:
+                    logging.error(f"Unhandled error in {name} scraper: {e}")
+
+            # Save once after all scrapers
+            save_seen_listings(seen_listings)
+
+            if total_new:
+                logging.debug(f"Total new listings this run: {total_new}")
             else:
-                logging.debug("No new listings.")
+                logging.debug("No new listings found.")
+
         except Exception as e:
-            logging.error(f"Unexpected error: {e}")
+            logging.error(f"Unexpected error in main loop: {e}")
 
         time.sleep(10800)  # Wait 3 hours before next scrape
