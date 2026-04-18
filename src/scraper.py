@@ -6,6 +6,7 @@ import os
 from dotenv import load_dotenv
 import logging
 from collections import deque
+from datetime import datetime, timezone
 
 logging.basicConfig(
     level=logging.DEBUG, format="|%(levelname)s| %(asctime)s - %(message)s"
@@ -16,6 +17,11 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY")
+
+INFLUXDB_URL = os.getenv("INFLUXDB_URL")
+INFLUXDB_TOKEN = os.getenv("INFLUXDB_TOKEN")
+INFLUXDB_ORG = os.getenv("INFLUXDB_ORG", "")
+INFLUXDB_BUCKET = os.getenv("INFLUXDB_BUCKET", "idealista")
 
 # Search URLs — alquiler en Sevilla
 IDEALISTA_URL = "https://www.idealista.com/alquiler-viviendas/sevilla-sevilla/?ordenado-por=fecha-publicacion-desc"
@@ -44,6 +50,90 @@ MAX_LISTINGS = 300
 ERROR_LOG_FILE = "/app/data/error_log.json"
 
 SCRAPERAPI_BASE = "http://api.scraperapi.com"
+
+
+# ---------------------------------------------------------------------------
+# InfluxDB metrics
+# ---------------------------------------------------------------------------
+
+
+def publish_metrics(
+    scraper: str, listings_new: int, duration_seconds: float, success: bool
+):
+    """
+    Write a single data point to InfluxDB for a scraper run.
+    Silently skipped if INFLUXDB_URL or INFLUXDB_TOKEN are not configured.
+
+    Measurement: scraper_run
+    Tags:        scraper=<name>
+    Fields:
+      listings_new        — number of new listings found
+      duration_seconds    — wall-clock time the scraper took
+      success             — 1 if completed without error, 0 otherwise
+    """
+    if not INFLUXDB_URL or not INFLUXDB_TOKEN:
+        return
+
+    try:
+        from influxdb_client import InfluxDBClient, Point, WritePrecision
+        from influxdb_client.client.write_api import SYNCHRONOUS
+
+        point = (
+            Point("scraper_run")
+            .tag("scraper", scraper)
+            .field("listings_new", listings_new)
+            .field("duration_seconds", round(duration_seconds, 3))
+            .field("success", 1 if success else 0)
+            .time(datetime.now(timezone.utc), WritePrecision.SECONDS)
+        )
+
+        with InfluxDBClient(
+            url=INFLUXDB_URL, token=INFLUXDB_TOKEN, org=INFLUXDB_ORG
+        ) as client:
+            client.write_api(write_options=SYNCHRONOUS).write(
+                bucket=INFLUXDB_BUCKET, record=point
+            )
+
+        logging.debug(f"InfluxDB: wrote metrics for {scraper}")
+
+    except Exception as e:
+        logging.warning(f"InfluxDB write failed (non-fatal): {e}")
+
+
+def publish_run_summary(total_new: int, total_duration_seconds: float):
+    """
+    Write a summary point for the full scraping run.
+
+    Measurement: run_summary
+    Fields:
+      total_new           — total new listings across all scrapers
+      duration_seconds    — total wall-clock time for the full run
+    """
+    if not INFLUXDB_URL or not INFLUXDB_TOKEN:
+        return
+
+    try:
+        from influxdb_client import InfluxDBClient, Point, WritePrecision
+        from influxdb_client.client.write_api import SYNCHRONOUS
+
+        point = (
+            Point("run_summary")
+            .field("total_new", total_new)
+            .field("duration_seconds", round(total_duration_seconds, 3))
+            .time(datetime.now(timezone.utc), WritePrecision.SECONDS)
+        )
+
+        with InfluxDBClient(
+            url=INFLUXDB_URL, token=INFLUXDB_TOKEN, org=INFLUXDB_ORG
+        ) as client:
+            client.write_api(write_options=SYNCHRONOUS).write(
+                bucket=INFLUXDB_BUCKET, record=point
+            )
+
+        logging.debug("InfluxDB: wrote run_summary")
+
+    except Exception as e:
+        logging.warning(f"InfluxDB run_summary write failed (non-fatal): {e}")
 
 
 def load_seen_listings():
@@ -583,22 +673,39 @@ if __name__ == "__main__":
             seen_set = set(seen_listings)
 
             total_new = 0
+            run_start = time.monotonic()
 
             for scraper_fn, name in [
-                (scrape_idealista, "Idealista"),
-                (scrape_pisos, "Pisos.com"),
-                (scrape_fotocasa, "Fotocasa"),
-                (scrape_casas, "Casas.com"),
+                (scrape_idealista, "idealista"),
+                (scrape_pisos, "pisos"),
+                (scrape_fotocasa, "fotocasa"),
+                (scrape_casas, "casas"),
             ]:
+                t0 = time.monotonic()
+                success = True
+                new = []
                 try:
                     new = scraper_fn(seen_listings, seen_set)
                     total_new += len(new)
                     logging.debug(f"{name}: {len(new)} new listings")
                 except Exception as e:
+                    success = False
                     logging.error(f"Unhandled error in {name} scraper: {e}")
+                finally:
+                    publish_metrics(
+                        scraper=name,
+                        listings_new=len(new),
+                        duration_seconds=time.monotonic() - t0,
+                        success=success,
+                    )
 
             # Save once after all scrapers
             save_seen_listings(seen_listings)
+
+            run_duration = time.monotonic() - run_start
+            publish_run_summary(
+                total_new=total_new, total_duration_seconds=run_duration
+            )
 
             if total_new:
                 logging.debug(f"Total new listings this run: {total_new}")
