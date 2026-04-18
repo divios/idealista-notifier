@@ -87,7 +87,7 @@ def publish_metrics(
             .field("listings_new", listings_new)
             .field("duration_seconds", round(duration_seconds, 3))
             .field("success", 1 if success else 0)
-            .time(datetime.now(timezone.utc), WritePrecision.SECONDS)
+            .time(datetime.now(timezone.utc), WritePrecision.S)
         )
 
         with InfluxDBClient(
@@ -123,7 +123,7 @@ def publish_run_summary(total_new: int, total_duration_seconds: float):
             Point("run_summary")
             .field("total_new", total_new)
             .field("duration_seconds", round(total_duration_seconds, 3))
-            .time(datetime.now(timezone.utc), WritePrecision.SECONDS)
+            .time(datetime.now(timezone.utc), WritePrecision.S)
         )
 
         with InfluxDBClient(
@@ -199,7 +199,7 @@ def publish_listing_metrics(scraper: str, listing: dict):
             .tag("scraper", scraper)
             .tag("location", listing.get("location") or "unknown")
             .field("link", listing.get("link", ""))
-            .time(datetime.now(timezone.utc), WritePrecision.SECONDS)
+            .time(datetime.now(timezone.utc), WritePrecision.S)
         )
 
         price_eur = parse_price_eur(listing.get("price_raw", ""))
