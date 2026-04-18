@@ -1,3 +1,4 @@
+import re
 import requests
 from bs4 import BeautifulSoup
 import json
@@ -134,6 +135,96 @@ def publish_run_summary(total_new: int, total_duration_seconds: float):
 
     except Exception as e:
         logging.warning(f"InfluxDB run_summary write failed (non-fatal): {e}")
+
+
+# ---------------------------------------------------------------------------
+# Numeric parsers
+# ---------------------------------------------------------------------------
+
+
+def parse_price_eur(raw: str) -> float | None:
+    """Extract a numeric monthly rent from strings like '1.200 €/mes', '950€', '1,200'."""
+    if not raw:
+        return None
+    # Remove thousands separators (dot or space used in Spanish formatting)
+    cleaned = raw.replace(".", "").replace("\xa0", "").replace(" ", "")
+    match = re.search(r"(\d+(?:,\d+)?)", cleaned)
+    if match:
+        return float(match.group(1).replace(",", "."))
+    return None
+
+
+def parse_rooms(raw: str) -> int | None:
+    """Extract room count from strings like '3 hab.', '2 habitaciones', '4 rooms'."""
+    if not raw:
+        return None
+    match = re.search(r"(\d+)", raw)
+    return int(match.group(1)) if match else None
+
+
+def parse_size_m2(raw: str) -> float | None:
+    """Extract square metres from strings like '75 m²', '90m2', '120 metros'."""
+    if not raw:
+        return None
+    match = re.search(r"(\d+(?:[.,]\d+)?)\s*m", raw, re.IGNORECASE)
+    if match:
+        return float(match.group(1).replace(",", "."))
+    return None
+
+
+def publish_listing_metrics(scraper: str, listing: dict):
+    """
+    Write one data point per new listing to InfluxDB.
+    Silently skipped if INFLUXDB_URL or INFLUXDB_TOKEN are not configured.
+
+    Measurement: listing
+    Tags:        scraper=<name>, location=<barrio>
+    Fields:
+      price_eur   — monthly rent in euros (float, optional)
+      rooms       — number of rooms (int, optional)
+      size_m2     — surface in square metres (float, optional)
+      link        — listing URL (string)
+    """
+    if not INFLUXDB_URL or not INFLUXDB_TOKEN:
+        return
+
+    try:
+        from influxdb_client import InfluxDBClient, Point, WritePrecision
+        from influxdb_client.client.write_api import SYNCHRONOUS
+
+        point = (
+            Point("listing")
+            .tag("scraper", scraper)
+            .tag("location", listing.get("location") or "unknown")
+            .field("link", listing.get("link", ""))
+            .time(datetime.now(timezone.utc), WritePrecision.SECONDS)
+        )
+
+        price_eur = parse_price_eur(listing.get("price_raw", ""))
+        if price_eur is not None:
+            point = point.field("price_eur", price_eur)
+
+        rooms = parse_rooms(listing.get("rooms_raw", ""))
+        if rooms is not None:
+            point = point.field("rooms", rooms)
+
+        size_m2 = parse_size_m2(listing.get("size_raw", ""))
+        if size_m2 is not None:
+            point = point.field("size_m2", size_m2)
+
+        with InfluxDBClient(
+            url=INFLUXDB_URL, token=INFLUXDB_TOKEN, org=INFLUXDB_ORG
+        ) as client:
+            client.write_api(write_options=SYNCHRONOUS).write(
+                bucket=INFLUXDB_BUCKET, record=point
+            )
+
+        logging.debug(
+            f"InfluxDB: wrote listing metric for {scraper} — {listing.get('link', '')}"
+        )
+
+    except Exception as e:
+        logging.warning(f"InfluxDB listing write failed (non-fatal): {e}")
 
 
 def load_seen_listings():
@@ -281,7 +372,7 @@ def scrape_idealista(seen_listings, seen_set):
         save_error_status(None)
 
     soup = BeautifulSoup(response.text, "html.parser")
-    new_links = []
+    new_listings = []
     pending_notifications = []
 
     for listing in soup.find_all("article", class_="item"):
@@ -297,16 +388,30 @@ def scrape_idealista(seen_listings, seen_set):
             description = description_el.get_text(strip=True) if description_el else ""
 
             price_el = listing.find("span", class_="item-price")
+            price_raw = price_el.get_text(strip=True) if price_el else ""
             price = (
-                price_el.get_text(strip=True).split("€")[0].strip() + " €/mes"
-                if price_el
+                price_raw.split("€")[0].strip() + " €/mes"
+                if price_raw
                 else "Precio no disponible"
             )
 
             details = listing.find_all("span", class_="item-detail")
-            rooms = details[0].get_text(strip=True) if len(details) > 0 else "—"
-            size = details[1].get_text(strip=True) if len(details) > 1 else "—"
+            rooms_raw = details[0].get_text(strip=True) if len(details) > 0 else ""
+            size_raw = details[1].get_text(strip=True) if len(details) > 1 else ""
             floor = details[2].get_text(strip=True) if len(details) > 2 else "—"
+
+            rooms = rooms_raw or "—"
+            size = size_raw or "—"
+
+            # Location: dedicated span or fall back to title
+            location_el = listing.find(
+                "span", class_="item-detail-location"
+            ) or listing.find("p", class_="item-detail-location")
+            location = (
+                location_el.get_text(strip=True)
+                if location_el
+                else title.split(",")[-1].strip()
+            )
 
             if any(f.lower() in floor.lower() for f in EXCLUDED_FLOORS):
                 continue
@@ -323,7 +428,15 @@ def scrape_idealista(seen_listings, seen_set):
             if link in seen_set:
                 continue
 
-            new_links.append(link)
+            new_listings.append(
+                {
+                    "link": link,
+                    "price_raw": price_raw,
+                    "rooms_raw": rooms_raw,
+                    "size_raw": size_raw,
+                    "location": location,
+                }
+            )
             seen_listings.append(link)
             seen_set.add(link)
 
@@ -373,7 +486,7 @@ def scrape_idealista(seen_listings, seen_set):
             send_telegram_notification(notif["message"], image_url=notif["image_url"])
             time.sleep(0.5)
 
-    return new_links
+    return new_listings
 
 
 # ---------------------------------------------------------------------------
@@ -390,12 +503,11 @@ def scrape_pisos(seen_listings, seen_set):
         return []
 
     soup = BeautifulSoup(response.text, "html.parser")
-    new_links = []
+    new_listings = []
     pending_notifications = []
 
     for listing in soup.find_all("div", class_="ad-preview"):
         try:
-            listing_id = listing.get("id", "")
             relative_url = listing.get("data-lnk-href", "")
             if not relative_url:
                 continue
@@ -409,19 +521,22 @@ def scrape_pisos(seen_listings, seen_set):
             title_el = listing.find("a", class_="ad-preview__title")
             title = title_el.get_text(strip=True) if title_el else "Sin título"
 
+            # Location — subtitle paragraph
+            subtitle_el = listing.find("p", class_="ad-preview__subtitle")
+            location = subtitle_el.get_text(strip=True) if subtitle_el else "Sevilla"
+
             # Price — strip the /mes child span
-            price = "Precio no disponible"
+            price_raw = ""
             price_el = listing.find("span", class_="ad-preview__price")
             if price_el:
-                # Remove child spans (e.g. "/mes") and grab remaining text
                 for child in price_el.find_all("span"):
                     child.decompose()
-                price = price_el.get_text(strip=True)
+                price_raw = price_el.get_text(strip=True)
 
-            # Details: rooms, bathrooms, size, floor — each in <p class="ad-preview__char ...">
+            # Details: rooms, size, floor — each in <p class="ad-preview__char ...">
             details = listing.find_all("p", class_="ad-preview__char")
-            rooms = details[0].get_text(strip=True) if len(details) > 0 else "—"
-            size = details[1].get_text(strip=True) if len(details) > 1 else "—"
+            rooms_raw = details[0].get_text(strip=True) if len(details) > 0 else ""
+            size_raw = details[1].get_text(strip=True) if len(details) > 1 else ""
             floor = details[2].get_text(strip=True) if len(details) > 2 else "—"
 
             # Image
@@ -432,16 +547,25 @@ def scrape_pisos(seen_listings, seen_set):
                 if img_el:
                     image_url = img_el.get("src") or img_el.get("data-src")
 
-            new_links.append(link)
+            new_listings.append(
+                {
+                    "link": link,
+                    "price_raw": price_raw,
+                    "rooms_raw": rooms_raw,
+                    "size_raw": size_raw,
+                    "location": location,
+                }
+            )
             seen_listings.append(link)
             seen_set.add(link)
 
             message = (
                 f"🏠 <b>Nuevo piso en alquiler (Pisos.com)</b>\n\n"
-                f"<b>{title}</b>\n\n"
-                f"💰 {price}\n"
-                f"🛏 {rooms}\n"
-                f"📐 {size}\n"
+                f"<b>{title}</b>\n"
+                f"📍 {location}\n\n"
+                f"💰 {price_raw or 'Precio no disponible'}\n"
+                f"🛏 {rooms_raw or '—'}\n"
+                f"📐 {size_raw or '—'}\n"
                 f"🏢 {floor}\n\n"
                 f'🔗 <a href="{link}">Ver anuncio</a>'
             )
@@ -459,7 +583,7 @@ def scrape_pisos(seen_listings, seen_set):
             send_telegram_notification(notif["message"], image_url=notif["image_url"])
             time.sleep(0.5)
 
-    return new_links
+    return new_listings
 
 
 # ---------------------------------------------------------------------------
@@ -477,14 +601,11 @@ def scrape_fotocasa(seen_listings, seen_set):
         return []
 
     soup = BeautifulSoup(response.text, "html.parser")
-    new_links = []
+    new_listings = []
     pending_notifications = []
 
-    # Fotocasa renders listing cards as <article> elements
-    # Each card has a link, price, and detail spans
     for listing in soup.find_all("article"):
         try:
-            # Link — look for the main anchor with an href containing /es/alquiler/
             link_el = listing.find("a", href=lambda h: h and "/es/alquiler/" in h)
             if not link_el:
                 continue
@@ -495,17 +616,27 @@ def scrape_fotocasa(seen_listings, seen_set):
             if link in seen_set:
                 continue
 
-            # Title — usually in an h3 or the link text
             title_el = listing.find("h3") or listing.find("h2") or link_el
             title = title_el.get_text(strip=True) if title_el else "Sin título"
 
-            # Price
-            price = "Precio no disponible"
+            # Location — subtitle or address span
+            location_el = listing.find(
+                class_=lambda c: (
+                    c
+                    and (
+                        "location" in c.lower()
+                        or "address" in c.lower()
+                        or "subtitle" in c.lower()
+                    )
+                )
+            )
+            location = location_el.get_text(strip=True) if location_el else "Sevilla"
+
+            price_raw = ""
             price_el = listing.find(class_=lambda c: c and "price" in c.lower())
             if price_el:
-                price = price_el.get_text(strip=True)
+                price_raw = price_el.get_text(strip=True)
 
-            # Details — rooms, size, floor typically in spans with feature/detail classes
             detail_els = listing.find_all(
                 lambda tag: (
                     tag.name in ("span", "li")
@@ -516,26 +647,36 @@ def scrape_fotocasa(seen_listings, seen_set):
                     )
                 )
             )
-            rooms = detail_els[0].get_text(strip=True) if len(detail_els) > 0 else "—"
-            size = detail_els[1].get_text(strip=True) if len(detail_els) > 1 else "—"
+            rooms_raw = (
+                detail_els[0].get_text(strip=True) if len(detail_els) > 0 else ""
+            )
+            size_raw = detail_els[1].get_text(strip=True) if len(detail_els) > 1 else ""
             floor = detail_els[2].get_text(strip=True) if len(detail_els) > 2 else "—"
 
-            # Image
             image_url = None
             img_el = listing.find("img")
             if img_el:
                 image_url = img_el.get("src") or img_el.get("data-src")
 
-            new_links.append(link)
+            new_listings.append(
+                {
+                    "link": link,
+                    "price_raw": price_raw,
+                    "rooms_raw": rooms_raw,
+                    "size_raw": size_raw,
+                    "location": location,
+                }
+            )
             seen_listings.append(link)
             seen_set.add(link)
 
             message = (
                 f"🏠 <b>Nuevo piso en alquiler (Fotocasa)</b>\n\n"
-                f"<b>{title}</b>\n\n"
-                f"💰 {price}\n"
-                f"🛏 {rooms}\n"
-                f"📐 {size}\n"
+                f"<b>{title}</b>\n"
+                f"📍 {location}\n\n"
+                f"💰 {price_raw or 'Precio no disponible'}\n"
+                f"🛏 {rooms_raw or '—'}\n"
+                f"📐 {size_raw or '—'}\n"
                 f"🏢 {floor}\n\n"
                 f'🔗 <a href="{link}">Ver anuncio</a>'
             )
@@ -551,7 +692,7 @@ def scrape_fotocasa(seen_listings, seen_set):
             send_telegram_notification(notif["message"], image_url=notif["image_url"])
             time.sleep(0.5)
 
-    return new_links
+    return new_listings
 
 
 # ---------------------------------------------------------------------------
@@ -569,7 +710,7 @@ def scrape_casas(seen_listings, seen_set):
             return []
 
         soup = BeautifulSoup(response.text, "html.parser")
-        new_links = []
+        new_listings = []
         pending_notifications = []
 
         # Casas.com listing cards — typically <article> or <div> with listing data
@@ -593,10 +734,24 @@ def scrape_casas(seen_listings, seen_set):
                 title_el = listing.find("h2") or listing.find("h3") or link_el
                 title = title_el.get_text(strip=True) if title_el else "Sin título"
 
-                price = "Precio no disponible"
+                location_el = listing.find(
+                    class_=lambda c: (
+                        c
+                        and (
+                            "location" in c.lower()
+                            or "address" in c.lower()
+                            or "subtitle" in c.lower()
+                        )
+                    )
+                )
+                location = (
+                    location_el.get_text(strip=True) if location_el else "Sevilla"
+                )
+
+                price_raw = ""
                 price_el = listing.find(class_=lambda c: c and "price" in c.lower())
                 if price_el:
-                    price = price_el.get_text(strip=True)
+                    price_raw = price_el.get_text(strip=True)
 
                 detail_els = listing.find_all(
                     lambda tag: (
@@ -608,11 +763,11 @@ def scrape_casas(seen_listings, seen_set):
                         )
                     )
                 )
-                rooms = (
-                    detail_els[0].get_text(strip=True) if len(detail_els) > 0 else "—"
+                rooms_raw = (
+                    detail_els[0].get_text(strip=True) if len(detail_els) > 0 else ""
                 )
-                size = (
-                    detail_els[1].get_text(strip=True) if len(detail_els) > 1 else "—"
+                size_raw = (
+                    detail_els[1].get_text(strip=True) if len(detail_els) > 1 else ""
                 )
                 floor = (
                     detail_els[2].get_text(strip=True) if len(detail_els) > 2 else "—"
@@ -623,16 +778,25 @@ def scrape_casas(seen_listings, seen_set):
                 if img_el:
                     image_url = img_el.get("src") or img_el.get("data-src")
 
-                new_links.append(link)
+                new_listings.append(
+                    {
+                        "link": link,
+                        "price_raw": price_raw,
+                        "rooms_raw": rooms_raw,
+                        "size_raw": size_raw,
+                        "location": location,
+                    }
+                )
                 seen_listings.append(link)
                 seen_set.add(link)
 
                 message = (
                     f"🏠 <b>Nuevo piso en alquiler (Casas.com)</b>\n\n"
-                    f"<b>{title}</b>\n\n"
-                    f"💰 {price}\n"
-                    f"🛏 {rooms}\n"
-                    f"📐 {size}\n"
+                    f"<b>{title}</b>\n"
+                    f"📍 {location}\n\n"
+                    f"💰 {price_raw or 'Precio no disponible'}\n"
+                    f"🛏 {rooms_raw or '—'}\n"
+                    f"📐 {size_raw or '—'}\n"
                     f"🏢 {floor}\n\n"
                     f'🔗 <a href="{link}">Ver anuncio</a>'
                 )
@@ -654,7 +818,7 @@ def scrape_casas(seen_listings, seen_set):
                 )
                 time.sleep(0.5)
 
-        return new_links
+        return new_listings
 
     except Exception as e:
         logging.warning(f"Casas.com scraper failed — skipping silently: {e}")
@@ -688,6 +852,8 @@ if __name__ == "__main__":
                     new = scraper_fn(seen_listings, seen_set)
                     total_new += len(new)
                     logging.debug(f"{name}: {len(new)} new listings")
+                    for listing_data in new:
+                        publish_listing_metrics(scraper=name, listing=listing_data)
                 except Exception as e:
                     success = False
                     logging.error(f"Unhandled error in {name} scraper: {e}")
