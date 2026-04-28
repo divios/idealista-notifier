@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 import logging
 from collections import deque
 from datetime import datetime, timezone
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 logging.basicConfig(
     level=logging.DEBUG, format="|%(levelname)s| %(asctime)s - %(message)s"
@@ -388,6 +389,57 @@ def fetch_direct(url, render=False, retries=2):
     return None
 
 
+def fetch_via_playwright(url, wait_seconds=4):
+    """
+    Fetch a URL using a real Firefox browser via Playwright.
+    Unlike curl_cffi, this actually executes JavaScript — necessary to pass
+    Akamai Bot Manager challenges (used by idealista.com).
+
+    Uses stock Firefox (not Chromium) because Akamai is known to pass standard
+    Firefox while blocking heavily-patched browsers like camoufox.
+    navigator.webdriver is patched via add_init_script to reduce automation signals.
+    Returns the page HTML as a string, or None on failure.
+    """
+    try:
+        with sync_playwright() as p:
+            browser = p.firefox.launch(
+                headless=True,
+                firefox_user_prefs={
+                    "intl.accept_languages": "es-ES,es,en",
+                    "privacy.resistFingerprinting": False,
+                },
+            )
+            context = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) "
+                    "Gecko/20100101 Firefox/126.0"
+                ),
+                locale="es-ES",
+                viewport={"width": 1280, "height": 900},
+                java_script_enabled=True,
+            )
+            # Patch automation signals before any page script runs
+            context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                Object.defineProperty(navigator, 'languages', { get: () => ['es-ES', 'es', 'en'] });
+            """)
+            page = context.new_page()
+            logging.debug(f"fetch_via_playwright: navigating to {url}")
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            # Extra wait for JS challenges to resolve
+            time.sleep(wait_seconds)
+            html = page.content()
+            browser.close()
+            logging.debug(f"fetch_via_playwright: got {len(html)} bytes")
+            return html
+    except PlaywrightTimeoutError:
+        logging.error(f"fetch_via_playwright: timeout fetching {url}")
+        return None
+    except Exception as e:
+        logging.error(f"fetch_via_playwright: error fetching {url}: {e}")
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Idealista
 # ---------------------------------------------------------------------------
@@ -396,11 +448,21 @@ def fetch_direct(url, render=False, retries=2):
 def scrape_idealista(seen_listings, seen_set):
     logging.debug("Scraping Idealista...")
 
-    response = fetch_direct(IDEALISTA_URL, render=False)
     error_status = load_error_status()
+    html = fetch_via_playwright(IDEALISTA_URL)
 
-    if response is None or response.status_code == 403:
-        logging.warning("⚠️ Error 403 — Idealista has blocked access after all retries")
+    if html is None:
+        logging.warning("⚠️ Idealista: fetch_via_playwright returned None")
+        if error_status.get("last_error") != 403:
+            send_telegram_notification(
+                "🚨 <b>Error detectado</b>\nIdealista ha bloqueado el acceso."
+            )
+            save_error_status(403)
+        return []
+
+    # Akamai challenge pages contain this marker when JS hasn't resolved
+    if "Please enable JavaScript" in html or len(html) < 2000:
+        logging.warning("⚠️ Idealista: received bot-challenge page, access blocked")
         if error_status.get("last_error") != 403:
             send_telegram_notification(
                 "🚨 <b>Error 403 detectado</b>\nIdealista ha bloqueado el acceso."
@@ -408,10 +470,10 @@ def scrape_idealista(seen_listings, seen_set):
             save_error_status(403)
         return []
 
-    if response.status_code == 200 and error_status.get("last_error") == 403:
+    if error_status.get("last_error") == 403:
         save_error_status(None)
 
-    soup = BeautifulSoup(response.text, "html.parser")
+    soup = BeautifulSoup(html, "html.parser")
     new_listings = []
     pending_notifications = []
 
