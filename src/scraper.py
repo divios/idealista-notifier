@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 import logging
 from collections import deque
 from datetime import datetime, timezone
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from patchright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 logging.basicConfig(
     level=logging.DEBUG, format="|%(levelname)s| %(asctime)s - %(message)s"
@@ -389,44 +389,44 @@ def fetch_direct(url, render=False, retries=2):
     return None
 
 
-def fetch_via_playwright(url, wait_seconds=4):
+def fetch_via_playwright(url, wait_seconds=5):
     """
-    Fetch a URL using a real Firefox browser via Playwright.
-    Unlike curl_cffi, this actually executes JavaScript — necessary to pass
-    Akamai Bot Manager challenges (used by idealista.com).
-
-    Uses stock Firefox (not Chromium) because Akamai is known to pass standard
-    Firefox while blocking heavily-patched browsers like camoufox.
-    navigator.webdriver is patched via add_init_script to reduce automation signals.
+    Fetch a URL using patchright — a fork of Playwright with deep Chromium
+    patches that remove automation signals at the binary level (CDP leaks,
+    HeadlessChrome UA, runtime.enable fingerprint, etc.).
+    Required to pass Akamai Bot Manager challenges served by idealista.com.
     Returns the page HTML as a string, or None on failure.
     """
     try:
         with sync_playwright() as p:
-            browser = p.firefox.launch(
+            browser = p.chromium.launch(
                 headless=True,
-                firefox_user_prefs={
-                    "intl.accept_languages": "es-ES,es,en",
-                    "privacy.resistFingerprinting": False,
-                },
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                ],
             )
             context = browser.new_context(
                 user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) "
-                    "Gecko/20100101 Firefox/126.0"
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
                 ),
                 locale="es-ES",
                 viewport={"width": 1280, "height": 900},
                 java_script_enabled=True,
             )
-            # Patch automation signals before any page script runs
             context.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
                 Object.defineProperty(navigator, 'languages', { get: () => ['es-ES', 'es', 'en'] });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                window.chrome = { runtime: {} };
             """)
             page = context.new_page()
             logging.debug(f"fetch_via_playwright: navigating to {url}")
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            # Extra wait for JS challenges to resolve
+            # Wait for Akamai JS challenge to complete and redirect to real page
             time.sleep(wait_seconds)
             html = page.content()
             browser.close()
