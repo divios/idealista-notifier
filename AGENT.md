@@ -14,10 +14,10 @@ Objetivo: detectar nuevos pisos disponibles en alquiler en Sevilla antes de que 
 | Capa | Tecnología |
 |---|---|
 | Lenguaje | Python 3.9 |
-| Scraping | `cloudscraper` (bypass Cloudflare) + `requests` |
+| Scraping | `curl_cffi` (impersonación TLS de Chrome, bypass Cloudflare) |
 | Parsing HTML | `beautifulsoup4` |
 | Notificaciones | Telegram Bot API |
-| User-Agent spoofing | `fake_useragent` |
+| User-Agent spoofing | headers aleatorios integrados en `fetch_direct()` |
 | Config / secrets | `python-dotenv` |
 | Contenedor | Docker + Docker Compose |
 | Deploy cloud | Railway.app |
@@ -27,8 +27,7 @@ Objetivo: detectar nuevos pisos disponibles en alquiler en Sevilla antes de que 
 requests==2.31.0
 beautifulsoup4==4.12.2
 python-dotenv==1.0.0
-fake_useragent==2.0.3
-cloudscraper==1.2.71
+curl_cffi==0.7.4
 ```
 
 ---
@@ -60,7 +59,7 @@ idealista-notifier/
         ▼
 scrape_idealista()
         │
-        ├─ cloudscraper GET → página de resultados Idealista
+        ├─ curl_cffi GET (impersonando Chrome) → página de resultados Idealista
         │   (Sevilla, alquiler, ordenado por fecha de publicación)
         │
         ├─ BeautifulSoup parsea <article class="item">
@@ -105,8 +104,6 @@ Con imagen adjunta si está disponible. Para áticos, el header cambia a `🚨 �
 TELEGRAM_BOT_TOKEN=your_bot_token_here
 TELEGRAM_CHAT_ID=your_group_chat_id_here
 ```
-
-> El `TELEGRAM_CHAT_ID` de un grupo es un número negativo (ej: `-1001234567890`).
 > El bot debe estar añadido como miembro del grupo.
 
 ### Parámetros in-code (`src/scraper.py`)
@@ -161,7 +158,7 @@ railway logs -f
 
 ## Patrones y convenciones
 
-- **Anti-bot evasion**: `cloudscraper` + `fake_useragent` (Chrome en Windows) + delays aleatorios.
+- **Anti-bot evasion**: `curl_cffi` con `impersonate="chrome"` (fingerprint TLS real) + headers HTTP aleatorios (User-Agent, Referer, Sec-Fetch-*) + delays aleatorios entre peticiones.
 - **Deduplicación stateful**: `collections.deque(maxlen=100)` persistida como JSON.
 - **One-shot error alerting**: `error_log.json` previene spam — el alert de 403 se envía una sola vez, se limpia cuando vuelve el acceso.
 - **Notificaciones en lote**: todos los nuevos anuncios de un ciclo se encolan y envían en batch al final, no mid-loop.

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import re
-import requests
+import random
+from curl_cffi import requests
 from bs4 import BeautifulSoup
 import json
 import time
@@ -19,7 +20,6 @@ logging.basicConfig(
 load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY")
 
 INFLUXDB_URL = os.getenv("INFLUXDB_URL")
 INFLUXDB_TOKEN = os.getenv("INFLUXDB_TOKEN")
@@ -51,8 +51,6 @@ MAX_LISTINGS = 300
 
 # Track if an error has already been notified
 ERROR_LOG_FILE = "/app/data/error_log.json"
-
-SCRAPERAPI_BASE = "http://api.scraperapi.com"
 
 
 # ---------------------------------------------------------------------------
@@ -318,31 +316,71 @@ def send_telegram_notification(text, image_url=None):
         return False
 
 
-def fetch_via_scraperapi(url, render=False, retries=2):
-    """
-    Fetch a URL via ScraperAPI with optional JS rendering.
-    Returns the response or None on failure.
-    """
-    params = {
-        "api_key": SCRAPERAPI_KEY,
-        "url": url,
-        "country_code": "es",
-        "render": "true" if render else "false",
+_CHROME_VERSIONS = ["124", "125", "126", "127"]
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{v}.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{v}.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{v}.0.0.0 Safari/537.36",
+]
+
+
+def _build_headers(url: str) -> dict:
+    """Return realistic browser headers for the given URL."""
+    version = random.choice(_CHROME_VERSIONS)
+    ua = random.choice(_USER_AGENTS).format(v=version)
+    from urllib.parse import urlparse
+    origin = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
+    return {
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Referer": origin + "/",
+        "DNT": "1",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-User": "?1",
     }
+
+
+def fetch_direct(url, render=False, retries=2):
+    """
+    Fetch a URL directly using curl_cffi, which impersonates a real Chrome
+    browser at the TLS fingerprint level (JA3/JA4), bypassing Cloudflare and
+    similar bot-detection systems without any paid proxy service.
+
+    The `render` parameter is accepted for API compatibility but ignored —
+    curl_cffi does not execute JavaScript. If a portal requires JS rendering
+    and returns empty results, consider switching that specific scraper to
+    Playwright.
+    """
+    if render:
+        logging.debug(f"fetch_direct: render=True requested for {url} — JS will NOT be executed")
 
     for attempt in range(1, retries + 1):
         try:
-            logging.debug(f"ScraperAPI fetch attempt {attempt}: {url}")
-            response = requests.get(SCRAPERAPI_BASE, params=params, timeout=60)
-            logging.debug(f"ScraperAPI response: {response.status_code}")
+            delay = random.uniform(1.5, 4.0)
+            logging.debug(f"fetch_direct attempt {attempt} (delay {delay:.1f}s): {url}")
+            time.sleep(delay)
+
+            response = requests.get(
+                url,
+                headers=_build_headers(url),
+                impersonate="chrome",
+                timeout=60,
+            )
+            logging.debug(f"fetch_direct response: {response.status_code}")
             if response.status_code == 200:
                 return response
             else:
                 logging.warning(
-                    f"ScraperAPI returned {response.status_code}: {response.text[:200]}"
+                    f"fetch_direct returned {response.status_code}: {response.text[:200]}"
                 )
         except Exception as e:
-            logging.error(f"ScraperAPI request failed (attempt {attempt}): {e}")
+            logging.error(f"fetch_direct request failed (attempt {attempt}): {e}")
 
         if attempt < retries:
             time.sleep(5)
@@ -358,7 +396,7 @@ def fetch_via_scraperapi(url, render=False, retries=2):
 def scrape_idealista(seen_listings, seen_set):
     logging.debug("Scraping Idealista...")
 
-    response = fetch_via_scraperapi(IDEALISTA_URL, render=False)
+    response = fetch_direct(IDEALISTA_URL, render=False)
     error_status = load_error_status()
 
     if response is None or response.status_code == 403:
@@ -499,7 +537,7 @@ def scrape_idealista(seen_listings, seen_set):
 def scrape_pisos(seen_listings, seen_set):
     logging.debug("Scraping Pisos.com...")
 
-    response = fetch_via_scraperapi(PISOS_URL, render=False)
+    response = fetch_direct(PISOS_URL, render=False)
     if response is None:
         logging.warning("Failed to fetch Pisos.com")
         return []
@@ -597,7 +635,7 @@ def scrape_fotocasa(seen_listings, seen_set):
     logging.debug("Scraping Fotocasa...")
 
     # Use render=true so ScraperAPI executes the React SPA and returns full HTML
-    response = fetch_via_scraperapi(FOTOCASA_URL, render=True)
+    response = fetch_direct(FOTOCASA_URL, render=True)
     if response is None:
         logging.warning("Failed to fetch Fotocasa")
         return []
@@ -706,7 +744,7 @@ def scrape_casas(seen_listings, seen_set):
     logging.debug("Scraping Casas.com...")
 
     try:
-        response = fetch_via_scraperapi(CASAS_URL, render=False, retries=2)
+        response = fetch_direct(CASAS_URL, render=False, retries=2)
         if response is None:
             logging.warning("Casas.com: failed after retries — skipping silently")
             return []
